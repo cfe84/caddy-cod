@@ -1,4 +1,4 @@
-module github.com/charlesfeval/caddy-cod
+module github.com/cfe84/caddy-cod
 
 go 1.26.0
 
