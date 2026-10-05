@@ -52,7 +52,9 @@ Place the directive explicitly using `route` when ordering with other handlers m
 
 Different endpoints may reference the same container. They share one lifecycle and aggregate active requests and idle time. Require their idle timeout, startup delay, upstream readiness target, and health endpoint to agree; reject conflicts during provisioning. Request timeout and retry policy may differ by route.
 
-Resolve names to container IDs when provisioning so aliases cannot create separate managers for the same container. Container replacement requires a configuration reload; do not silently start managing a different ID under a reused name.
+Resolve configured names to canonical Docker names for shared ownership across recreation and reloads. Expand ID references to full IDs and keep them pinned. Reject mixed name-based and ID-pinned registrations for the same container because they express incompatible replacement policies.
+
+Inspect named containers on request admission, including warm requests, to detect replacement before forwarding. If the name is temporarily missing, poll within the request timeout. Adopt the replacement ID through the shared startup/readiness operation. Every Docker start, status wait, reconciliation, and stop is pinned to that operation's resolved ID; idle stop and cleanup never resolve a name to stop an unadopted replacement. A missing old ID during stop is already stopped. Initial provisioning still requires the configured container to exist.
 
 ## Runtime architecture
 

@@ -111,9 +111,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		logger:  h.logger,
 	}
 
-	key := dockerEndpointKey(docker, info.ID)
+	reference, identity := containerReference(h.Container, info)
+	key := dockerEndpointKey(docker, identity)
 	pooled, loaded, err := lifecycleManagers.LoadOrNew(key, func() (caddy.Destructor, error) {
-		return newManager(docker, info.ID, policy, state, h.logger.Named("lifecycle")), nil
+		manager := newManager(docker, info.ID, policy, state, h.logger.Named("lifecycle"))
+		manager.containerRef = reference
+		return manager, nil
 	})
 	if err != nil {
 		_ = proxy.Cleanup()
@@ -124,7 +127,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	clientOwned = false
 	h.manager = pooled.(*manager)
-	if err := h.manager.checkPolicy(policy); err != nil {
+	if err := h.manager.checkRegistration(policy, reference); err != nil {
 		_, releaseErr := lifecycleManagers.Delete(key)
 		h.manager = nil
 		_ = proxy.Cleanup()
@@ -153,7 +156,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		if budget.expired.Load() {
 			err = context.DeadlineExceeded
 		}
-		h.logger.Error("container unavailable for request", zap.String("container_id", h.manager.clientID), zap.Error(err))
+		h.logger.Error("container unavailable for request", zap.String("container", h.manager.containerRef), zap.String("container_id", h.manager.currentID()), zap.Error(err))
 		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
 	defer h.manager.Release()

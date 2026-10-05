@@ -3,6 +3,7 @@ package containerproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/errdefs"
 	"go.uber.org/zap"
 )
 
@@ -223,6 +225,66 @@ func TestCleanupDeadlineCoversDockerOperations(t *testing.T) {
 	}
 }
 
+func TestReplacementDuringStopIsNotTargeted(t *testing.T) {
+	docker := newFakeDocker(container.StateRunning)
+	docker.id, docker.name = "original-id", "app"
+	docker.stopEntered, docker.allowStop = make(chan struct{}, 1), make(chan struct{}, 1)
+	manager := newManager(docker, docker.id, lifecyclePolicy{}, managerReady, zap.NewNop())
+	result := make(chan error, 1)
+	go func() {
+		err, _ := manager.stopContainer(context.Background())
+		result <- err
+	}()
+	<-docker.stopEntered
+	docker.mu.Lock()
+	docker.id = "replacement-id"
+	docker.mu.Unlock()
+	docker.allowStop <- struct{}{}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	docker.mu.Lock()
+	defer docker.mu.Unlock()
+	if !docker.state.Running || len(docker.stoppedIDs) != 1 || docker.stoppedIDs[0] != "original-id" {
+		t.Fatalf("replacement affected by stop: state=%v stop IDs=%v", docker.state, docker.stoppedIDs)
+	}
+	manager.cancel()
+}
+
+func TestRemovedContainerDoesNotStopReplacement(t *testing.T) {
+	for _, pinned := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ID-pinned=%t", pinned), func(t *testing.T) {
+			docker := newFakeDocker(container.StateRunning)
+			docker.id, docker.name = "original-id", "app"
+			manager := newManager(docker, docker.id, lifecyclePolicy{idleTimeout: time.Hour}, managerReady, zap.NewNop())
+			if !pinned {
+				manager.containerRef = "app"
+			}
+			if err := manager.activate(); err != nil {
+				t.Fatal(err)
+			}
+			docker.mu.Lock()
+			docker.id = "replacement-id"
+			docker.mu.Unlock()
+			if pinned {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				if _, err := manager.Acquire(ctx); !errdefs.IsNotFound(err) {
+					t.Fatalf("pinned ID error = %v; want not found", err)
+				}
+			}
+			if err := manager.Destruct(); err != nil {
+				t.Fatal(err)
+			}
+			docker.mu.Lock()
+			defer docker.mu.Unlock()
+			if docker.starts != 0 || docker.stops != 0 {
+				t.Fatalf("cleanup touched replacement: starts=%d stops=%d", docker.starts, docker.stops)
+			}
+		})
+	}
+}
+
 func waitForActiveLeases(t *testing.T, manager *manager, want int) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -255,6 +317,11 @@ func waitForState(t *testing.T, manager *manager, want managerState) {
 
 type fakeDocker struct {
 	mu           sync.Mutex
+	id           string
+	name         string
+	missing      bool
+	startedIDs   []string
+	stoppedIDs   []string
 	state        container.State
 	starts       int
 	stops        int
@@ -277,7 +344,7 @@ func newFakeDocker(state container.ContainerState) *fakeDocker {
 	}
 }
 
-func (d *fakeDocker) ContainerInspect(ctx context.Context, _ string) (container.InspectResponse, error) {
+func (d *fakeDocker) ContainerInspect(ctx context.Context, reference string) (container.InspectResponse, error) {
 	d.mu.Lock()
 	delay := d.inspectDelay
 	d.mu.Unlock()
@@ -293,19 +360,31 @@ func (d *fakeDocker) ContainerInspect(ctx context.Context, _ string) (container.
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	state := d.state
+	if d.missing || (d.id != "" && reference != d.id && reference != d.name) {
+		return container.InspectResponse{}, errdefs.NotFound(errors.New("no such container"))
+	}
+	id := d.id
+	if id == "" {
+		id = "test-id"
+	}
 	return container.InspectResponse{ContainerJSONBase: &container.ContainerJSONBase{
-		ID: "test-id", State: &state,
+		ID: id, Name: "/" + d.name, State: &state,
 	}}, nil
 }
 
-func (d *fakeDocker) ContainerStart(ctx context.Context, _ string, _ container.StartOptions) error {
+func (d *fakeDocker) ContainerStart(ctx context.Context, id string, _ container.StartOptions) error {
 	d.mu.Lock()
 	d.starts++
+	d.startedIDs = append(d.startedIDs, id)
 	d.mu.Unlock()
 	d.startEntered <- struct{}{}
 	select {
 	case <-d.allowStart:
 		d.mu.Lock()
+		if d.missing || (d.id != "" && id != d.id) {
+			d.mu.Unlock()
+			return errdefs.NotFound(errors.New("no such container"))
+		}
 		d.state = container.State{Status: container.StateRunning, Running: true}
 		d.mu.Unlock()
 		return nil
@@ -314,10 +393,11 @@ func (d *fakeDocker) ContainerStart(ctx context.Context, _ string, _ container.S
 	}
 }
 
-func (d *fakeDocker) ContainerStop(ctx context.Context, _ string, _ container.StopOptions) error {
+func (d *fakeDocker) ContainerStop(ctx context.Context, id string, _ container.StopOptions) error {
 	d.mu.Lock()
 	stopEntered, allowStop := d.stopEntered, d.allowStop
 	d.stops++
+	d.stoppedIDs = append(d.stoppedIDs, id)
 	delay := d.stopDelay
 	d.mu.Unlock()
 	if stopEntered != nil {
@@ -338,6 +418,10 @@ func (d *fakeDocker) ContainerStop(ctx context.Context, _ string, _ container.St
 		}
 	}
 	d.mu.Lock()
+	if d.missing || (d.id != "" && id != d.id) {
+		d.mu.Unlock()
+		return errdefs.NotFound(errors.New("no such container"))
+	}
 	d.state = container.State{Status: container.StateExited}
 	d.mu.Unlock()
 	select {

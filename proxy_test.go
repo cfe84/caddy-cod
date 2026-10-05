@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -132,6 +133,82 @@ func TestCaddyValidationCleanupDoesNotStopContainers(t *testing.T) {
 	fake.mu.Unlock()
 	if starts != 0 || stops != 0 || closes != 1 {
 		t.Fatalf("validation Docker starts/stops/closes = %d/%d/%d; want 0/0/1", starts, stops, closes)
+	}
+}
+
+func TestRealProxyWaitsForRecreatedContainer(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "replacement ready")
+	}))
+	defer upstream.Close()
+	fake := newFakeDocker(container.StateRunning)
+	fake.id, fake.name = "original-id", "test-id"
+	setDockerFactory(t, func() (dockerAPI, error) { return fake, nil })
+	config := proxyTestConfig(t, upstream.URL, freeTCPAddress(t))
+	if err := caddy.Load(config, true); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = caddy.Stop() })
+	address := "http://" + activeHTTPServer(t).Listeners()[0].Addr().String()
+	response, err := http.Get(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("initial status = %d", response.StatusCode)
+	}
+	fake.mu.Lock()
+	fake.missing = true
+	fake.mu.Unlock()
+	result := make(chan error, 1)
+	go func() {
+		response, err := http.Get(address)
+		if err == nil {
+			defer response.Body.Close()
+			body, readErr := io.ReadAll(response.Body)
+			err = readErr
+			if err == nil && (response.StatusCode != http.StatusOK || string(body) != "replacement ready") {
+				err = fmt.Errorf("replacement response = %d %q", response.StatusCode, body)
+			}
+		}
+		result <- err
+	}()
+	// Admission waits through the deployment gap rather than returning 500.
+	waitForState(t, activeProxyHandler(t).manager, managerStarting)
+	select {
+	case err := <-result:
+		t.Fatalf("request returned before replacement existed: %v", err)
+	default:
+	}
+	fake.mu.Lock()
+	fake.id = "replacement-id"
+	fake.missing = false
+	fake.state = container.State{Status: container.StateCreated}
+	fake.mu.Unlock()
+	select {
+	case <-fake.startEntered:
+	case <-time.After(time.Second):
+		t.Fatal("replacement was not started")
+	}
+	fake.allowStart <- struct{}{}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	owner := activeProxyHandler(t).manager
+	if err := caddy.Load(config, true); err != nil {
+		t.Fatal(err)
+	}
+	if activeProxyHandler(t).manager != owner {
+		t.Fatal("reload created another lifecycle owner for the replacement")
+	}
+	if err := caddy.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.startedIDs) != 1 || fake.startedIDs[0] != "replacement-id" || len(fake.stoppedIDs) != 1 || fake.stoppedIDs[0] != "replacement-id" {
+		t.Fatalf("start IDs = %v, stop IDs = %v; want replacement ID only", fake.startedIDs, fake.stoppedIDs)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -19,23 +20,38 @@ type dockerAPI interface {
 	DaemonHost() string
 }
 
+func containerReference(configured string, info container.InspectResponse) (reference, identity string) {
+	configured = strings.TrimPrefix(configured, "/")
+	name := strings.TrimPrefix(info.Name, "/")
+	if configured != name && strings.HasPrefix(info.ID, configured) {
+		if name == "" {
+			name = info.ID
+		}
+		return info.ID, name
+	}
+	if name == "" {
+		name = configured
+	}
+	return name, name
+}
+
 var newDockerClient = func() (dockerAPI, error) {
 	return client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 }
 
 type managerRegistryKey struct {
-	endpoint    string
-	tlsVerify   string
-	certificate string
-	containerID string
+	endpoint          string
+	tlsVerify         string
+	certificate       string
+	containerIdentity string
 }
 
-func dockerEndpointKey(docker dockerAPI, containerID string) managerRegistryKey {
+func dockerEndpointKey(docker dockerAPI, identity string) managerRegistryKey {
 	return managerRegistryKey{
-		endpoint:    docker.DaemonHost(),
-		tlsVerify:   os.Getenv("DOCKER_TLS_VERIFY"),
-		certificate: os.Getenv("DOCKER_CERT_PATH"),
-		containerID: containerID,
+		endpoint:          docker.DaemonHost(),
+		tlsVerify:         os.Getenv("DOCKER_TLS_VERIFY"),
+		certificate:       os.Getenv("DOCKER_CERT_PATH"),
+		containerIdentity: identity,
 	}
 }
 

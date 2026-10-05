@@ -8,6 +8,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"github.com/docker/docker/api/types/container"
 )
 
 func TestContainerProxyCaddyfileOptions(t *testing.T) {
@@ -51,6 +52,20 @@ func TestContainerProxyAdaptsAsHTTPHandler(t *testing.T) {
 	}
 	if !strings.Contains(string(config), `"handler":"container_proxy"`) {
 		t.Fatalf("adapted Caddy JSON does not contain the handler: %s", config)
+	}
+}
+
+func TestContainerReferencesPreserveReplacementPolicy(t *testing.T) {
+	info := container.InspectResponse{ContainerJSONBase: &container.ContainerJSONBase{ID: "abcdef012345", Name: "/app"}}
+	for _, test := range []struct{ configured, reference string }{
+		{"app", "app"}, {"/app", "app"}, {"abcdef", info.ID}, {info.ID, info.ID},
+	} {
+		t.Run(test.configured, func(t *testing.T) {
+			reference, identity := containerReference(test.configured, info)
+			if reference != test.reference || identity != "app" {
+				t.Fatalf("reference/identity = %q/%q; want %q/app", reference, identity, test.reference)
+			}
+		})
 	}
 }
 

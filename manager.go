@@ -11,6 +11,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/errdefs"
 	"go.uber.org/zap"
 )
 
@@ -50,13 +51,15 @@ type managerOperation struct {
 }
 
 type manager struct {
-	mu       sync.Mutex
-	docker   dockerAPI
-	clientID string
-	policy   lifecyclePolicy
-	logger   *zap.Logger
-	ctx      context.Context
-	cancel   context.CancelFunc
+	mu           sync.Mutex
+	docker       dockerAPI
+	clientID     string
+	containerRef string
+	resolvedID   string
+	policy       lifecyclePolicy
+	logger       *zap.Logger
+	ctx          context.Context
+	cancel       context.CancelFunc
 
 	state        managerState
 	active       int
@@ -77,15 +80,17 @@ type manager struct {
 func newManager(docker dockerAPI, id string, policy lifecyclePolicy, state managerState, logger *zap.Logger) *manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &manager{
-		docker:      docker,
-		clientID:    id,
-		policy:      policy,
-		logger:      logger,
-		ctx:         ctx,
-		cancel:      cancel,
-		state:       state,
-		activeZero:  closedSignal(),
-		probeClient: &http.Client{Timeout: time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		docker:       docker,
+		clientID:     id,
+		containerRef: id,
+		resolvedID:   id,
+		policy:       policy,
+		logger:       logger,
+		ctx:          ctx,
+		cancel:       cancel,
+		state:        state,
+		activeZero:   closedSignal(),
+		probeClient:  &http.Client{Timeout: time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 	}
 	return m
 }
@@ -117,6 +122,19 @@ func (m *manager) checkPolicy(policy lifecyclePolicy) error {
 		return nil
 	}
 	return fmt.Errorf("container %s already has a lifecycle manager with a different idle timeout, startup delay, upstream, or health endpoint", m.clientID)
+}
+
+func (m *manager) checkRegistration(policy lifecyclePolicy, reference string) error {
+	if m.containerRef != reference {
+		return errors.New("routes for the same container must not mix name-based and ID-pinned references")
+	}
+	return m.checkPolicy(policy)
+}
+
+func (m *manager) currentID() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.resolvedID
 }
 
 func (m *manager) activate() error {
@@ -173,12 +191,16 @@ func (m *manager) Acquire(ctx context.Context) (bool, error) {
 	m.stopIdleTimerLocked()
 	m.stopRetryTimerLocked()
 	cold := m.state != managerReady
+	generation := m.generation
 	m.mu.Unlock()
 
 	if err := m.waitUntilReady(ctx); err != nil {
 		m.Release()
 		return cold, err
 	}
+	m.mu.Lock()
+	cold = cold || generation != m.generation
+	m.mu.Unlock()
 	return cold, nil
 }
 
@@ -205,8 +227,28 @@ func (m *manager) waitUntilReady(ctx context.Context) error {
 	for {
 		m.mu.Lock()
 		if m.state == managerReady {
+			id := m.resolvedID
+			generation := m.generation
 			m.mu.Unlock()
-			return nil
+			info, err := inspectContainer(ctx, m.docker, m.containerRef)
+			if err != nil && !errdefs.IsNotFound(err) {
+				return err
+			}
+			if err == nil && info.ID == id && info.State.Running && !info.State.Paused && !info.State.Restarting {
+				m.mu.Lock()
+				ready := m.generation == generation && m.state == managerReady
+				m.mu.Unlock()
+				if ready {
+					return nil
+				}
+				continue
+			}
+			m.mu.Lock()
+			if m.generation == generation && m.state == managerReady {
+				m.state = managerUnavailable
+			}
+			m.mu.Unlock()
+			continue
 		}
 		if m.retired {
 			m.mu.Unlock()
@@ -249,6 +291,12 @@ func (m *manager) waitUntilReady(ctx context.Context) error {
 
 func (m *manager) start(generation uint64, ctx context.Context, cancel context.CancelFunc) {
 	state, err := m.startContainer(ctx)
+	for errdefs.IsNotFound(err) && m.containerRef != m.clientID && ctx.Err() == nil {
+		if err = sleepContext(ctx, probeInterval); err != nil {
+			break
+		}
+		state, err = m.startContainer(ctx)
+	}
 	if err != nil && errors.Is(ctx.Err(), context.Canceled) {
 		state = m.reconcileState()
 	}
@@ -277,10 +325,14 @@ func (m *manager) start(generation uint64, ctx context.Context, cancel context.C
 }
 
 func (m *manager) startContainer(ctx context.Context) (managerState, error) {
-	info, err := inspectContainer(ctx, m.docker, m.clientID)
+	info, err := inspectContainer(ctx, m.docker, m.containerRef)
 	if err != nil {
 		return managerUnavailable, err
 	}
+	id := info.ID
+	m.mu.Lock()
+	m.resolvedID = id
+	m.mu.Unlock()
 	state := info.State
 	switch {
 	case state.Paused || state.Status == container.StatePaused:
@@ -290,20 +342,20 @@ func (m *manager) startContainer(ctx context.Context) (managerState, error) {
 	case state.Status == container.StateRemoving:
 		return managerUnavailable, errors.New("container is being removed")
 	case state.Restarting || state.Status == container.StateRestarting:
-		if err := m.waitForRunning(ctx); err != nil {
+		if err := m.waitForRunning(ctx, id); err != nil {
 			return managerUnavailable, err
 		}
 	case state.Running || state.Status == container.StateRunning:
 		// Adopt an already-running container; only its readiness is evaluated.
 	case state.Status == container.StateCreated || state.Status == container.StateExited:
-		if err := m.docker.ContainerStart(ctx, m.clientID, container.StartOptions{}); err != nil {
+		if err := m.docker.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
 			inspectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			info, inspectErr := inspectContainer(inspectCtx, m.docker, m.clientID)
+			info, inspectErr := inspectContainer(inspectCtx, m.docker, id)
 			cancel()
 			if inspectErr != nil || info.State == nil || (!info.State.Running && info.State.Status != container.StateRunning) {
 				return managerUnavailable, fmt.Errorf("starting container: %w", err)
 			}
-		} else if err := m.waitForRunning(ctx); err != nil {
+		} else if err := m.waitForRunning(ctx, id); err != nil {
 			return managerUnavailable, err
 		}
 	default:
@@ -321,11 +373,11 @@ func (m *manager) startContainer(ctx context.Context) (managerState, error) {
 	return managerReady, nil
 }
 
-func (m *manager) waitForRunning(ctx context.Context) error {
+func (m *manager) waitForRunning(ctx context.Context, id string) error {
 	ticker := time.NewTicker(probeInterval)
 	defer ticker.Stop()
 	for {
-		info, err := inspectContainer(ctx, m.docker, m.clientID)
+		info, err := inspectContainer(ctx, m.docker, id)
 		if err != nil {
 			return err
 		}
@@ -380,7 +432,7 @@ func (m *manager) probe(ctx context.Context) (bool, error) {
 func (m *manager) reconcileState() managerState {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	info, err := inspectContainer(ctx, m.docker, m.clientID)
+	info, err := inspectContainer(ctx, m.docker, m.currentID())
 	if err != nil {
 		m.logger.Error("failed to reconcile container state after startup cancellation", zap.String("container_id", m.clientID), zap.Error(err))
 		return managerUnavailable
@@ -467,9 +519,13 @@ func (m *manager) stopWhenIdle() {
 }
 
 func (m *manager) stopContainer(parent context.Context) (error, managerState) {
+	id := m.currentID()
 	inspectCtx, inspectCancel := context.WithTimeout(parent, 5*time.Second)
-	info, err := inspectContainer(inspectCtx, m.docker, m.clientID)
+	info, err := inspectContainer(inspectCtx, m.docker, id)
 	inspectCancel()
+	if errdefs.IsNotFound(err) {
+		return nil, managerStopped
+	}
 	if err != nil {
 		return err, managerUnavailable
 	}
@@ -481,13 +537,16 @@ func (m *manager) stopContainer(parent context.Context) (error, managerState) {
 	}
 	grace := int(stopGrace.Seconds())
 	stopCtx, stopCancel := context.WithTimeout(parent, stopAPITimeout)
-	err = m.docker.ContainerStop(stopCtx, m.clientID, container.StopOptions{Timeout: &grace})
+	err = m.docker.ContainerStop(stopCtx, id, container.StopOptions{Timeout: &grace})
 	stopCancel()
 	if err != nil {
 		stopErr := err
 		inspectCtx, inspectCancel := context.WithTimeout(parent, 5*time.Second)
-		latest, inspectErr := inspectContainer(inspectCtx, m.docker, m.clientID)
+		latest, inspectErr := inspectContainer(inspectCtx, m.docker, id)
 		inspectCancel()
+		if errdefs.IsNotFound(inspectErr) {
+			return nil, managerStopped
+		}
 		if inspectErr == nil && latest.State != nil {
 			switch latest.State.Status {
 			case container.StateCreated, container.StateExited:

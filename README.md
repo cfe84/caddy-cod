@@ -9,7 +9,7 @@ after it has been idle. It does not create, remove, or update containers.
 Build Caddy with this module using [xcaddy](https://github.com/caddyserver/xcaddy):
 
 ```sh
-xcaddy build --with github.com/charlesfeval/caddy-cod=.
+xcaddy build --with github.com/cfe84/caddy-cod=.
 ```
 
 Run the resulting Caddy binary with the Docker environment configured. The
@@ -43,7 +43,7 @@ and independent of the incoming request.
 
 | Option | Required / default | Meaning |
 | --- | --- | --- |
-| `container` | Required | Existing container name or ID. It is resolved to its Docker ID when Caddy provisions the route. |
+| `container` | Required | Existing container name or ID. Names follow replacements automatically; IDs remain pinned. |
 | `idle_timeout` | Required | Positive Go duration after the last active request before Docker stop is requested. |
 | `timeout` | `10s` | Positive Go duration covering admission, startup/readiness, retries, and upstream response headers. It does not limit the response stream after headers. |
 | `health_endpoint` | Optional | Absolute path checked until it returns HTTP 2xx. Without it, Docker's running state is sufficient. |
@@ -62,12 +62,21 @@ explicitly with other handlers.
 ## Runtime behavior and current limits
 
 Routes in one Caddy process that resolve to the same Docker endpoint and
-container ID share one lifecycle owner. They must agree on idle timeout,
+container name share one lifecycle owner across recreation. ID references are
+expanded to full IDs and remain pinned; mixing name and ID references for the
+same container is rejected. Routes must agree on idle timeout,
 startup delay, upstream origin, and health endpoint; request timeouts and retry
 settings can differ. Reloads share that owner while old and new configurations
 overlap. Idle management remains active while at least one referencing
 configuration has started. Removing the final reference stops a container
 managed by an active configuration after active requests drain.
+
+Named containers are inspected on request admission so replacements are detected
+even when the old container was ready. A temporarily missing name is polled
+within the request's existing timeout. Replacement containers pass startup and
+readiness checks before forwarding. Docker start/stop operations use a resolved
+ID; cleanup never stops a replacement that this manager has not adopted. The
+container must still exist when initially provisioning the configuration.
 
 Each request has its own deadline; a canceled waiter does not cancel startup
 while other request leases remain. A shared startup attempt has a fixed
