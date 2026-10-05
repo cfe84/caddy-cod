@@ -146,6 +146,20 @@ func (m *manager) deactivate() {
 	}
 }
 
+func (m *manager) rollbackActivation() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.activeOwners == 0 {
+		return
+	}
+	m.activeOwners--
+	if m.activeOwners == 0 {
+		m.wasActivated = false
+		m.stopIdleTimerLocked()
+		m.stopRetryTimerLocked()
+	}
+}
+
 func (m *manager) Acquire(ctx context.Context) (bool, error) {
 	m.mu.Lock()
 	if m.retired {
@@ -439,7 +453,7 @@ func (m *manager) stopWhenIdle() {
 		close(operation.done)
 		if err != nil {
 			logFailure = true
-			if m.active == 0 && !m.retired {
+			if m.activeOwners > 0 && m.active == 0 && !m.retired {
 				m.retryTimer = time.AfterFunc(stopRetryDelay, m.stopWhenIdle)
 			}
 		} else if m.active == 0 && !m.retired && (newState == managerRunning || newState == managerReady || newState == managerUnavailable) {
@@ -519,14 +533,14 @@ func (m *manager) Destruct() error {
 		case <-opDone:
 		case <-cleanupCtx.Done():
 			m.logger.Error("timed out waiting for lifecycle operation during cleanup", zap.String("container_id", m.clientID))
-			return errors.Join(cleanupCtx.Err(), m.docker.Close())
+			return errors.Join(cleanupCtx.Err(), m.closeDocker())
 		}
 	}
 	select {
 	case <-activeZero:
 	case <-cleanupCtx.Done():
 		m.logger.Error("leaving managed container running because requests did not drain", zap.String("container_id", m.clientID))
-		return errors.Join(cleanupCtx.Err(), m.docker.Close())
+		return errors.Join(cleanupCtx.Err(), m.closeDocker())
 	}
 
 	var cleanupErr error
@@ -537,8 +551,16 @@ func (m *manager) Destruct() error {
 		}
 		cleanupErr = stopErr
 	}
-	closeErr := m.docker.Close()
+	closeErr := m.closeDocker()
 	return errors.Join(cleanupErr, closeErr)
+}
+
+func (m *manager) closeDocker() error {
+	err := m.docker.Close()
+	if err != nil {
+		m.logger.Error("failed to close Docker client during cleanup", zap.String("container_id", m.clientID), zap.Error(err))
+	}
+	return err
 }
 
 func sleepContext(ctx context.Context, duration time.Duration) error {

@@ -51,12 +51,13 @@ and independent of the incoming request.
 | `retries` | `0` | Maximum extra attempts for cold GET/HEAD requests without a body. Retries cover transport failures and 502/503/504 only. |
 | `retry_backoff` | `250ms` | Positive fixed delay between retries when retries are enabled. |
 
-Containers already running when the route is activated are adopted and receive
-an idle timer. A stopped container remains stopped until a request arrives.
-Configuring a container opts Caddy into stopping it. Ensure Docker restart
-policies or external controllers will not immediately undo an intentional
-idle stop. Use `route` if this directive must be ordered explicitly with other
-handlers.
+Containers already running when an active Caddy configuration starts are
+adopted and receive an idle timer. Provisioning and `caddy validate` do not start
+or stop containers. A stopped container remains stopped until a request arrives.
+Configuring a container in a running configuration opts Caddy into stopping
+it. Ensure Docker restart policies or external controllers will not immediately
+undo an intentional idle stop. Use `route` if this directive must be ordered
+explicitly with other handlers.
 
 ## Runtime behavior and current limits
 
@@ -64,16 +65,18 @@ Routes in one Caddy process that resolve to the same Docker endpoint and
 container ID share one lifecycle owner. They must agree on idle timeout,
 startup delay, upstream origin, and health endpoint; request timeouts and retry
 settings can differ. Reloads share that owner while old and new configurations
-overlap. Removing its final reference stops the managed container after
-active requests drain.
+overlap. Idle management remains active while at least one referencing
+configuration has started. Removing the final reference stops a container
+managed by an active configuration after active requests drain.
 
 Each request has its own deadline; a canceled waiter does not cancel startup
 while other request leases remain. A shared startup attempt has a fixed
 two-minute upper bound, independent of per-route request timeouts. Stop uses a
 10-second Docker grace period and retries a failed idle stop once per minute
-while the container remains idle. A finite 30-second cleanup drain prevents
-shutdown from hanging forever; if requests do not drain, cleanup logs the
-condition and leaves the container running.
+while the container remains idle. A single finite 30-second cleanup budget
+covers lifecycle-operation waiting, request draining, and Docker inspect, stop,
+and reconciliation calls. If requests do not drain before it expires, cleanup
+logs the condition and leaves the container running.
 
 The readiness probe uses Go's standard HTTP transport and system trust roots;
 the Caddy reverse proxy uses its provisioned HTTP transport. This version does

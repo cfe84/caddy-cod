@@ -11,7 +11,7 @@ import (
 const lifecycleAppID = "container_proxy_lifecycle"
 
 func init() {
-	caddy.RegisterModule(lifecycleApp{})
+	caddy.RegisterModule(new(lifecycleApp))
 }
 
 type lifecycleApp struct {
@@ -20,7 +20,7 @@ type lifecycleApp struct {
 	started  bool
 }
 
-func (lifecycleApp) CaddyModule() caddy.ModuleInfo {
+func (*lifecycleApp) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  lifecycleAppID,
 		New: func() caddy.Module { return new(lifecycleApp) },
@@ -52,7 +52,7 @@ func (a *lifecycleApp) Start() error {
 	for manager := range a.managers {
 		if err := manager.activate(); err != nil {
 			for _, previous := range activated {
-				previous.deactivate()
+				previous.rollbackActivation()
 			}
 			return fmt.Errorf("activating container %s lifecycle: %w", manager.clientID, err)
 		}

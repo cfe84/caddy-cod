@@ -135,6 +135,26 @@ func TestCaddyValidationCleanupDoesNotStopContainers(t *testing.T) {
 	}
 }
 
+func TestFailedProvisioningCleanupDoesNotStopContainers(t *testing.T) {
+	fake := newFakeDocker(container.StateRunning)
+	setDockerFactory(t, func() (dockerAPI, error) { return fake, nil })
+	invalidHandler := map[string]any{"handle": []any{map[string]any{"handler": "not_registered"}}}
+	configJSON := proxyTestConfig(t, "http://127.0.0.1:8080", freeTCPAddress(t), invalidHandler)
+	var config caddy.Config
+	if err := json.Unmarshal(configJSON, &config); err != nil {
+		t.Fatal(err)
+	}
+	if err := caddy.Validate(&config); err == nil {
+		t.Fatal("configuration with an unknown handler unexpectedly validated")
+	}
+	fake.mu.Lock()
+	starts, stops, closes := fake.starts, fake.stops, fake.closes
+	fake.mu.Unlock()
+	if starts != 0 || stops != 0 || closes != 1 {
+		t.Fatalf("failed provisioning Docker starts/stops/closes = %d/%d/%d; want 0/0/1", starts, stops, closes)
+	}
+}
+
 func TestReloadKeepsSharedLifecycleUntilFinalStop(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "ok")
@@ -185,14 +205,16 @@ func TestReloadKeepsSharedLifecycleUntilFinalStop(t *testing.T) {
 	}
 }
 
-func proxyTestConfig(t *testing.T, upstream, listen string) []byte {
+func proxyTestConfig(t *testing.T, upstream, listen string, extraRoutes ...any) []byte {
 	t.Helper()
+	routes := []any{map[string]any{"handle": []any{map[string]any{
+		"handler": "container_proxy", "upstream": upstream, "container": "test-id", "idle_timeout": "1h",
+	}}}}
+	routes = append(routes, extraRoutes...)
 	config := map[string]any{"apps": map[string]any{
 		"http": map[string]any{"servers": map[string]any{"test": map[string]any{
 			"listen": []string{listen},
-			"routes": []any{map[string]any{"handle": []any{map[string]any{
-				"handler": "container_proxy", "upstream": upstream, "container": "test-id", "idle_timeout": "1h",
-			}}}},
+			"routes": routes,
 		}}},
 	}}
 	encoded, err := json.Marshal(config)

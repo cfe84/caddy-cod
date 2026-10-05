@@ -6,9 +6,8 @@ A Go extension for Caddy starts an existing container when a request arrives, pr
 
 The initial implementation targets Docker Engine, including Docker-compatible engines where the required API behavior is supported. It uses the Docker Go client and Caddy's existing reverse proxy implementation rather than implementing either protocol itself.
 
-This document captures the original design. The implementation is now present;
-`README.md` is the operator guide and describes implemented behavior and known
-deviations from this design.
+`README.md` is the operator guide. This document records the architecture and
+lifecycle decisions implemented by the module.
 
 ## Caddyfile configuration
 
@@ -60,7 +59,8 @@ Resolve names to container IDs when provisioning so aliases cannot create separa
 ### Caddy modules
 
 * **`http.handlers.container_proxy`** owns request admission, the request startup/header deadline, lifecycle leases, and configuration. It delegates HTTP proxying, streaming, forwarded headers, and upgrades to Caddy's `reverseproxy.Handler`.
-* **A lifecycle manager** owns state and Docker operations for one container. A registry in a Caddy app module supplies one manager per Docker endpoint and container ID. The app also owns the shared Docker client and shutdown.
+* **A lifecycle manager** owns state and Docker operations for one container. A process-wide usage pool shares one manager per Docker endpoint and container ID across handlers and overlapping configurations.
+* **The lifecycle app** records which managers belong to each Caddy configuration. Its `Start` and `Stop` methods activate idle management only for configurations that actually start; provisioning-only validation cleanup has no container side effects.
 * **A transport wrapper** delegates to Caddy's configured HTTP transport and implements the narrowly scoped startup retries described below. It does not duplicate the reverse proxy's routing or response handling.
 
 Integrate with Caddy's provisioning, validation, and cleanup interfaces. Acquire manager registrations during provisioning and release them during cleanup, including partial provisioning failure. Registry references must survive overlapping old/new configurations during a graceful reload, using Caddy's established shared-resource facilities. Conflicting lifecycle policies during that overlap fail reload rather than allowing two managers to control one container.
@@ -71,7 +71,7 @@ Keep three responsibilities separate: Docker operations, lifecycle decisions, an
 
 Use the Docker client's established connection settings, normally the local Unix socket, with API version negotiation. Remote engines require the client's TLS/authentication configuration. Startup validates connectivity, inspects every configured container, and rejects missing containers or unsupported states. Do not start containers during configuration loading.
 
-Configuring a container opts it into stop management even if it was already running when Caddy started. This must be explicit in deployment documentation. Docker access is privileged infrastructure access; do not expose lifecycle operations through a public HTTP endpoint.
+An active configuration opts its container into stop management even if it was already running when Caddy started. Provisioning and `caddy validate` do not start or stop containers. Docker access is privileged infrastructure access; do not expose lifecycle operations through a public HTTP endpoint.
 
 ## Lifecycle
 
@@ -85,7 +85,7 @@ The manager tracks `stopped`, `starting`, `ready`, `stopping`, and `unavailable`
 6. **Idle stop:** When the timer fires, recheck that no request is active and the idle duration has actually elapsed. Atomically enter `stopping`, then issue Docker's stop operation outside the lock. Use a finite grace period, initially 10s, and an API deadline longer than that grace period. Docker may kill the process after the grace period.
 7. **Arrival during stop:** A request takes a lease and waits for stop to finish, then triggers/join a new startup. Never race start against a stop already dispatched; its request deadline still applies.
 
-An initially running container with no traffic receives an idle timer when the configuration becomes active. A stopped container stays stopped until demand arrives.
+An initially running container with no traffic receives an idle timer when the configuration starts. Provisioning alone does not begin idle management. A stopped container stays stopped until demand arrives.
 
 Only short state transitions occur under the lock. Docker calls, timers, health probes, and proxying run outside it. Startup/stop operations have generation tokens so late completion cannot overwrite a newer transition.
 
@@ -127,8 +127,8 @@ Disable Caddy's separate proxy retry loop for this directive so retries have one
 ## Reload, shutdown, and operating boundaries
 
 * Validate Docker access, container identity, upstream syntax, and shared policy before activating a configuration. Readiness itself is established on demand, since containers may intentionally be stopped.
-* Preserve active leases and managers across reloads. Removing the last route registration retires its manager after active requests finish; stop its managed container as final cleanup.
-* During Caddy shutdown, cancel startup work and drain HTTP requests through Caddy's existing shutdown lifecycle. Then perform bounded stop cleanup for managed containers. Report failures without masking the original shutdown/provisioning error.
+* Preserve active leases and managers across reloads. A shared manager remains active while any referencing configuration is started. Removing its final route registration retires the manager after active requests finish; stop its container only if an owning configuration actually started.
+* During Caddy shutdown, cancel startup work and drain HTTP requests through Caddy's existing shutdown lifecycle. One shared finite cleanup deadline covers lifecycle-operation waiting, request draining, and all Docker inspect/stop/reconciliation calls. Report failures without masking the original shutdown/provisioning error.
 * Hard process termination cannot guarantee cleanup. The initial version does not add an external watchdog; containers may remain running until Caddy restarts and idle management resumes.
 * One Caddy process owns a given container. Multiple independent Caddy instances controlling the same container require a distributed coordinator and are outside the initial scope. Fail conflicting registrations within one process; enforce deployment ownership outside it.
 * Long-lived connections intentionally keep containers running. Idle application-level WebSockets do not count as idle container traffic in this version.
