@@ -3,7 +3,7 @@ module github.com/cfe84/caddy-cod
 go 1.26.0
 
 require (
-	github.com/caddyserver/caddy/v2 v2.11.7
+	github.com/caddyserver/caddy/v2 v2.11.6
 	github.com/docker/docker v28.5.2+incompatible
 	go.uber.org/zap v1.28.0
 )
